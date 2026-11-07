@@ -1,1 +1,2 @@
-# Add runtime dependencies here.
+img2pdf==0.6.3
+Pillow==13.0.0
