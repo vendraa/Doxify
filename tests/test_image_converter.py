@@ -371,6 +371,8 @@ class StressTests(ConverterTestCase):
 class OfflineGuardTests(unittest.TestCase):
     """NFR-01: kode aplikasi tidak boleh memakai library jaringan."""
 
+    # selftest.py mengimpor socket hanya untuk MEMBLOKIR upaya koneksi (lihat tes di bawah).
+    ALLOWED = {("selftest.py", "socket")}
     FORBIDDEN = ("socket", "urllib", "http.client", "httplib", "requests", "aiohttp", "ftplib",
                  "smtplib", "telnetlib", "xmlrpc", "websocket", "httpx")
 
@@ -387,9 +389,27 @@ class OfflineGuardTests(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom) and node.module:
                     names = [node.module]
                 for n in names:
+                    if (py.name, n) in self.ALLOWED:
+                        continue
                     if any(n == f or n.startswith(f + ".") for f in self.FORBIDDEN):
                         offenders.append((py.name, n))
         self.assertEqual(offenders, [])
+
+    def test_selftest_only_references_socket_to_block_it(self):
+        """selftest.py boleh mengimpor socket hanya untuk memblokir/mencatat upaya koneksi.
+        Pastikan tidak ada satu pun PEMANGGILAN fungsi jaringan di dalamnya."""
+        import ast
+        tree = ast.parse((Path(__file__).resolve().parent.parent / "app" / "selftest.py").read_text(encoding="utf-8"))
+        network_calls = {"connect", "connect_ex", "sendto", "send", "sendall", "bind", "listen", "accept",
+                         "create_connection", "getaddrinfo", "gethostbyname", "socket"}
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+                if name in network_calls:
+                    offenders.append((name, node.lineno))
+        self.assertEqual(offenders, [], "selftest.py tidak boleh memanggil fungsi jaringan")
 
 
 if __name__ == "__main__":

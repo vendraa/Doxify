@@ -1,15 +1,20 @@
 """Converter gambar JPG/JPEG/PNG -> PDF (Fase 1, tanpa GUI)."""
 from __future__ import annotations
 
+import errno
+import io
 import logging
 import os
 import tempfile
+import time
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import img2pdf
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image
 
 from app.converters.base import (
     BaseConverter,
@@ -39,10 +44,24 @@ Image.MAX_IMAGE_PIXELS = None
 
 SUPPORTED_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png"})
 MAX_PIXELS = 150_000_000  # ~150 megapiksel per gambar (NFR-05)
-MAX_TOTAL_BYTES = 1_500_000_000  # batas data gambar per satu PDF gabungan
+MAX_TOTAL_BYTES = 1_000_000_000  # batas data gambar per satu PDF gabungan (puncak RAM ~1,2x)
+_TMP_PREFIX = ".doxify-"
+_STALE_TMP_SECONDS = 24 * 3600
 _EXIF_ORIENTATION = 0x0112
 _MARGIN_MM = {Margin.NONE: 0.0, Margin.SMALL: 10.0, Margin.MEDIUM: 20.0}
 _PRODUCER = "Doxify"
+
+
+@contextmanager
+def _quiet_pillow():
+    """Pillow memperingatkan soal EXIF korup lewat `warnings`; file seperti itu sudah kita
+    tangani sendiri, jadi peringatannya hanya mengotori konsol.
+
+    Dipasang lokal per pemanggilan (bukan filter global) agar tidak tertimpa kode lain.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
 
 
 @dataclass(frozen=True)
@@ -69,7 +88,7 @@ def inspect_image(path: str | Path) -> ImageInfo:
     if not path.is_file():
         raise InvalidImageError("File tidak ditemukan (mungkin sudah dipindah atau dihapus).")
     try:
-        with Image.open(path) as img:
+        with _quiet_pillow(), Image.open(path) as img:
             fmt = img.format
             if fmt not in ("JPEG", "PNG"):
                 raise InvalidImageError("Isi file bukan JPG atau PNG yang valid.")
@@ -80,7 +99,10 @@ def inspect_image(path: str | Path) -> ImageInfo:
                     f"Gambar terlalu besar ({mp:.0f} megapiksel). Batasnya {MAX_PIXELS // 1_000_000} megapiksel."
                 )
             img.load()
-            orientation = img.getexif().get(_EXIF_ORIENTATION, 1)
+            try:
+                orientation = img.getexif().get(_EXIF_ORIENTATION, 1)
+            except Exception:  # noqa: BLE001 - EXIF korup tidak boleh menggagalkan gambar yang piksel-nya sehat
+                orientation = 1
             if orientation not in range(1, 9):
                 orientation = 1  # nilai tidak valid (mis. 0 dari beberapa ponsel) diabaikan
             has_alpha = img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
@@ -89,13 +111,33 @@ def inspect_image(path: str | Path) -> ImageInfo:
         raise
     except PermissionError as exc:
         raise InvalidImageError("Tidak punya izin untuk membaca file ini.") from exc
-    except (UnidentifiedImageError, OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+    except MemoryError as exc:
+        raise InvalidImageError("Memori tidak cukup untuk membuka gambar ini. Gambar terlalu besar.") from exc
+    except Exception as exc:  # noqa: BLE001 - decoder Pillow bisa melempar banyak jenis error pada file korup
         raise InvalidImageError("File rusak atau bukan gambar yang valid.") from exc
 
 
-def _to_flat(img: Image.Image) -> Image.Image:
-    """Terapkan rotasi EXIF, ratakan transparansi ke latar putih (FR-30, FR-31)."""
-    img = ImageOps.exif_transpose(img)
+_TRANSPOSE = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+
+
+def _to_flat(img: Image.Image, orientation: int = 1) -> Image.Image:
+    """Terapkan rotasi EXIF, ratakan transparansi ke latar putih (FR-30, FR-31).
+
+    Sengaja tidak memakai ImageOps.exif_transpose: fungsi itu menulis ulang seluruh
+    EXIF dan bisa crash pada data EXIF/GPS yang korup. Orientasi di sini sudah
+    divalidasi oleh inspect_image.
+    """
+    method = _TRANSPOSE.get(orientation)
+    if method is not None:
+        img = img.transpose(method)
     if img.mode in ("I;16", "I;16B", "I;16L", "I"):
         img = img.point(lambda v: v / 256).convert("L")
     has_alpha = img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
@@ -130,33 +172,60 @@ def _layout_fun(settings: ConversionSettings):
     return img2pdf.get_layout_fun(pagesize, None, border, img2pdf.FitMode.into, auto_orient)
 
 
-def _write_atomic(dest: Path, data: bytes) -> None:
-    """Tulis lewat file sementara lalu rename, supaya tidak ada PDF setengah jadi."""
+def _output_error(exc: BaseException) -> DoxifyError:
+    """Terjemahkan kegagalan menulis menjadi pesan yang jelas bagi pengguna."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return OutputError("Disk penuh. Kosongkan ruang lalu coba lagi.")
+    if isinstance(exc, PermissionError):
+        return OutputError("File tujuan sedang dipakai aplikasi lain atau tidak ada izin menulis.")
+    if isinstance(exc, OSError):
+        return OutputError(f"Gagal menyimpan PDF: {exc.strerror or exc}")
+    return DoxifyError(f"Gagal menyusun PDF: {_short(exc)}")
+
+
+def _sweep_stale_tmp(directory: Path) -> None:
+    """Hapus sisa file sementara Doxify (>24 jam) di folder tujuan akibat crash/mati listrik."""
+    cutoff = time.time() - _STALE_TMP_SECONDS
+    try:
+        for entry in directory.glob(f"{_TMP_PREFIX}*.tmp"):
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+@contextmanager
+def _atomic_writer(dest: Path, before_commit: Callable[[], None] | None = None):
+    """Beri file object untuk menulis PDF; baru dipindah ke `dest` jika semuanya sukses.
+
+    Penulisan langsung ke file (bukan ke memori) menekan puncak RAM, dan rename atomik
+    mencegah PDF setengah jadi. `before_commit` dipanggil sesaat sebelum rename
+    (dipakai untuk pengecekan pembatalan).
+    """
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=".doxify-", suffix=".tmp")
+        _sweep_stale_tmp(dest.parent)
+        fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=_TMP_PREFIX, suffix=".tmp")
     except OSError as exc:
         raise OutputError(f"Tidak bisa menulis ke folder tujuan: {exc.strerror or exc}") from exc
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp_name, dest)
-    except PermissionError as exc:
-        _silent_unlink(tmp_name)
-        raise OutputError("File tujuan sedang dipakai aplikasi lain atau tidak ada izin menulis.") from exc
-    except OSError as exc:
-        _silent_unlink(tmp_name)
-        raise OutputError(f"Gagal menyimpan PDF: {exc.strerror or exc}") from exc
+            yield fh
+        if before_commit is not None:
+            before_commit()
+        try:
+            os.replace(tmp_name, dest)
+        except OSError as exc:
+            raise _output_error(exc) from exc
     except BaseException:
-        _silent_unlink(tmp_name)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
-
-
-def _silent_unlink(name: str) -> None:
-    try:
-        os.unlink(name)
-    except OSError:
-        pass
 
 
 class ImageConverter(BaseConverter):
@@ -217,13 +286,10 @@ class ImageConverter(BaseConverter):
 
         cancel.raise_if_cancelled()
         _report(progress, len(paths), total, "Menyusun PDF")
-        pdf_bytes, good = self._assemble(ready, settings, result)
-        if pdf_bytes is None:
-            return
-
-        cancel.raise_if_cancelled()
         dest = self._resolve_output(output, settings)
-        _write_atomic(dest, pdf_bytes)
+        good = self._assemble_to(ready, settings, result, dest, cancel)
+        if good is None:
+            return
         result.outputs.append(dest)
         result.converted.extend(orig for orig, _ in good)
         _report(progress, total, total, "Selesai")
@@ -236,12 +302,9 @@ class ImageConverter(BaseConverter):
             prepared = self._prepare_one(path, index, settings, workdir, result)
             if prepared is None:
                 continue
-            pdf_bytes, good = self._assemble([(path, prepared)], settings, result)
-            if pdf_bytes is None:
-                continue
-            cancel.raise_if_cancelled()
             dest = self._resolve_output(out_dir / path.stem, settings)
-            _write_atomic(dest, pdf_bytes)
+            if self._assemble_to([(path, prepared)], settings, result, dest, cancel) is None:
+                continue
             result.outputs.append(dest)
             result.converted.append(path)
         _report(progress, total, total, "Selesai")
@@ -255,8 +318,11 @@ class ImageConverter(BaseConverter):
             return self._prepare(info, index, settings, workdir)
         except DoxifyError as exc:
             result.failed.append(FailedFile(path, str(exc)))
-        except (OSError, ValueError) as exc:
-            result.failed.append(FailedFile(path, f"Gagal memproses gambar: {_short(exc)}"))
+        except MemoryError:
+            result.failed.append(FailedFile(path, "Memori tidak cukup untuk memproses gambar ini."))
+        except Exception as exc:  # noqa: BLE001 - jaring pengaman: satu file buruk tidak boleh menggagalkan batch
+            log.debug("Persiapan gambar gagal: %s", exc.__class__.__name__)
+            result.failed.append(FailedFile(path, f"Gagal memproses gambar ({exc.__class__.__name__})."))
         return None
 
     def _prepare(self, info: ImageInfo, index: int, settings: ConversionSettings, workdir: Path) -> Path:
@@ -289,8 +355,8 @@ class ImageConverter(BaseConverter):
         return self._save_flat(info, index, workdir, as_jpeg=False)
 
     def _save_flat(self, info: ImageInfo, index: int, workdir: Path, as_jpeg: bool) -> Path:
-        with Image.open(info.path) as img:
-            flat = _to_flat(img)
+        with _quiet_pillow(), Image.open(info.path) as img:
+            flat = _to_flat(img, info.orientation)
             if as_jpeg:  # hanya untuk JPG cermin yang jarang; kualitas tinggi
                 out = workdir / f"{index:05d}.jpg"
                 flat.save(out, "JPEG", quality=95, subsampling=0)
@@ -300,8 +366,8 @@ class ImageConverter(BaseConverter):
         return out
 
     def _save_compressed(self, info: ImageInfo, index: int, settings: ConversionSettings, workdir: Path) -> Path:
-        with Image.open(info.path) as img:
-            flat = _to_flat(img)
+        with _quiet_pillow(), Image.open(info.path) as img:
+            flat = _to_flat(img, info.orientation)
             if settings.max_long_edge and max(flat.size) > settings.max_long_edge:
                 flat.thumbnail((settings.max_long_edge, settings.max_long_edge), Image.Resampling.LANCZOS)
             out = workdir / f"{index:05d}.jpg"
@@ -310,37 +376,59 @@ class ImageConverter(BaseConverter):
 
     # ---- perakitan PDF ----------------------------------------------------
 
-    def _assemble(self, items, settings, result):
-        """Rakit PDF. Jika gagal, cari gambar bermasalah, lewati, lalu coba lagi."""
+    def _assemble_to(self, items, settings, result, dest: Path, cancel: CancelToken):
+        """Rakit PDF langsung ke `dest` (atomik). Mengembalikan daftar item yang masuk,
+        atau None jika tidak ada yang bisa dimasukkan.
+
+        Jika perakitan gagal, gambar diperiksa satu per satu untuk menemukan penyebabnya:
+        gambar bermasalah dilewati; jika semua gambar sehat, kegagalannya ada di sisi
+        penulisan file (disk penuh, izin) dan dilaporkan sebagai OutputError.
+        """
         layout = _layout_fun(settings)
 
-        def build(paths: list[Path]) -> bytes:
-            return img2pdf.convert(
+        def build(paths: list[Path], stream) -> None:
+            img2pdf.convert(
                 paths,
                 layout_fun=layout,
                 rotation=img2pdf.Rotation.ifvalid,
                 producer=_PRODUCER,
                 creator=_PRODUCER,
+                outputstream=stream,
             )
 
+        def write(entries) -> None:
+            with _atomic_writer(dest, before_commit=cancel.raise_if_cancelled) as fh:
+                build([prep for _, prep in entries], fh)
+
+        failure: BaseException | None = None
         try:
-            return build([prep for _, prep in items]), items
-        except Exception:  # noqa: BLE001 - kegagalan library apa pun ditangani di bawah
-            log.debug("Perakitan gabungan gagal, memeriksa satu per satu", exc_info=True)
+            write(items)
+            return items
+        except (ConversionCancelled, OutputError):
+            raise
+        except Exception as first_error:  # noqa: BLE001 - dianalisis di bawah
+            failure = first_error  # nama pada 'as' dihapus Python setelah blok except
+            log.debug("Perakitan gagal (%s), memeriksa gambar satu per satu", first_error.__class__.__name__)
 
         good = []
         for orig, prep in items:
+            cancel.raise_if_cancelled()
             try:
-                build([prep])
+                build([prep], io.BytesIO())
                 good.append((orig, prep))
             except Exception as exc:  # noqa: BLE001
                 result.failed.append(FailedFile(orig, f"Gagal dimasukkan ke PDF: {_short(exc)}"))
+        if len(good) == len(items):
+            raise _output_error(failure)
         if not good:
-            return None, []
+            return None
         try:
-            return build([prep for _, prep in good]), good
+            write(good)
+            return good
+        except (ConversionCancelled, OutputError):
+            raise
         except Exception as exc:  # noqa: BLE001
-            raise DoxifyError(f"Gagal menyusun PDF: {_short(exc)}") from exc
+            raise _output_error(exc) from exc
 
     def _resolve_output(self, target: Path, settings: ConversionSettings) -> Path:
         try:

@@ -9,6 +9,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from PySide6.QtWidgets import QApplication
 
+    from app import __version__
     from app.ui.main_window import MainWindow
     from app.utils.temp import cleanup_stale_temp_dirs
 
@@ -17,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv)
     app.setApplicationName("Doxify")
     app.setOrganizationName("Doxify")
+    app.setApplicationVersion(__version__)
 
     window = MainWindow()
     window.show()
