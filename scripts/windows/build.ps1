@@ -13,8 +13,8 @@
    7. SHA256SUMS.txt dan build-info.txt  (daftar versi library yang dipakai, untuk jejak build)
 
   Prasyarat (di komputer pengembangan, butuh internet hanya untuk memasang alat build):
-   - virtualenv proyek aktif dan `pip install -r requirements.txt`
-   - Inno Setup 6.3 atau lebih baru (https://jrsoftware.org/isinfo.php), untuk langkah 6
+   - Python 3.14 dalam virtualenv proyek, dengan `requirements.txt` dan `requirements-dev.txt` terpasang
+   - Inno Setup 6.3 atau 7 (https://jrsoftware.org/isinfo.php), untuk langkah 6
   Jalankan dari folder proyek:  .\scripts\windows\build.ps1
 
 .EXAMPLE
@@ -38,12 +38,23 @@ if (-not (Test-Path ".\app") -or -not (Test-Path ".\build.spec")) {
     Fail "Jalankan dari folder proyek Doxify (yang berisi folder app dan berkas build.spec)."
 }
 
-$version = (& $Python -c "from app import __version__; print(__version__)").Trim()
+# Beberapa distribusi Python Windows memakai konfigurasi isolated yang tidak
+# menambahkan direktori kerja ke sys.path. Pastikan paket proyek tetap dapat diimpor.
+$projectRoot = (Resolve-Path ".").Path
+if ($env:PYTHONPATH) {
+    $env:PYTHONPATH = "$projectRoot;$env:PYTHONPATH"
+} else {
+    $env:PYTHONPATH = $projectRoot
+}
+
+$versionOutput = & $Python -c "from app import __version__; print(__version__)"
 Check-Exit "membaca versi"
+$version = ($versionOutput | Out-String).Trim()
+if (-not $version) { Fail "versi aplikasi kosong." }
 Write-Host "Membangun Doxify $version" -ForegroundColor Green
 
 # Alat build (PyInstaller) dipasang di virtualenv; hanya langkah ini yang butuh internet.
-& $Python -c "import PyInstaller" 2>$null
+& $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
 if ($LASTEXITCODE -ne 0) {
     Step "Memasang PyInstaller (butuh internet, hanya di komputer pengembangan)"
     & $Python -m pip install -r requirements-build.txt
@@ -87,13 +98,16 @@ if ($SkipInstaller) {
 else {
     Step "6. Installer Inno Setup"
     $candidates = @(
+        "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe",
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
     )
     $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $iscc) {
-        Write-Host "Inno Setup 6 tidak ditemukan. Pasang dari https://jrsoftware.org/isinfo.php lalu jalankan ulang," -ForegroundColor Yellow
+        Write-Host "Inno Setup 6 atau 7 tidak ditemukan. Pasang dari https://jrsoftware.org/isinfo.php lalu jalankan ulang," -ForegroundColor Yellow
         Write-Host "atau pakai -SkipInstaller. ZIP portabel sudah jadi." -ForegroundColor Yellow
     }
     else {

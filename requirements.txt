@@ -1,5 +1,4 @@
 img2pdf==0.6.3
 Pillow==13.0.0
-# GUI (Fase 2). Setelah terpasang, kunci ke versi pasti dengan `pip freeze | findstr /i pyside`
-# lalu ganti baris di bawah ini dengan versi tersebut (mis. PySide6==6.x.y).
-PySide6>=6.7,<7
+# PySide6 6.10.1 adalah rilis pertama yang secara resmi mendukung Python 3.14.
+PySide6>=6.10.1,<7

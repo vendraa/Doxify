@@ -3,7 +3,7 @@
 **Konverter JPG/PNG ke PDF untuk Windows yang berjalan 100% di komputermu sendiri.**
 Tanpa upload, tanpa akun, tanpa koneksi internet.
 
-![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
+![Python 3.14](https://img.shields.io/badge/python-3.14-blue)
 ![Platform Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-informational)
 ![Offline](https://img.shields.io/badge/jaringan-tidak%20dipakai-success)
 ![Versi 1.0.0](https://img.shields.io/badge/versi-1.0.0-lightgrey)
@@ -92,12 +92,12 @@ Lihat [Roadmap](#roadmap).
 
 | Lapisan | Teknologi | Peran |
 |---|---|---|
-| Bahasa | Python 3.12 | Library PDF dan gambar yang matang, kode ringkas |
+| Bahasa | Python 3.14 | Library PDF dan gambar yang matang, kode ringkas |
 | GUI | PySide6 (Qt 6) | Drag-and-drop, daftar yang bisa diurutkan, dan threading yang andal |
 | Penyusun PDF | `img2pdf` | Menyisipkan JPG ke PDF **tanpa kompres ulang**, sehingga kualitas tetap asli |
 | Pemrosesan gambar | `Pillow` | Validasi, rotasi, perataan transparansi, mode terkompres |
 | Pengemasan | PyInstaller (mode folder) | Menjadi `Doxify.exe` yang tidak butuh Python terpasang |
-| Installer | Inno Setup 6 | Pemasangan per-pengguna tanpa hak administrator |
+| Installer | Inno Setup 6.3+ atau 7 | Pemasangan per-pengguna tanpa hak administrator |
 | Pengujian | `unittest` (kompatibel `pytest`), `pypdf` | Tes otomatis |
 
 Catatan: `img2pdf` membawa `pikepdf` (library native) sebagai dependensi, jadi ikut terbungkus di paket rilis.
@@ -130,16 +130,16 @@ menghapus folder tersebut (pengaturan ada di `%APPDATA%\Doxify`).
 
 ### C. Dari kode sumber (untuk pengembang)
 
-Prasyarat: Windows 10/11 64-bit dan [Python 3.12](https://www.python.org/downloads/) (64-bit).
+Prasyarat: Windows 10/11 64-bit dan [Python 3.14](https://www.python.org/downloads/) (64-bit).
 
 ```powershell
 # ambil kode proyek (git clone atau salin foldernya), lalu masuk ke foldernya
 cd doxify
 
-py -3.12 -m venv .venv
+py -3.14 -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt          # untuk menjalankan
-# pip install -r requirements-dev.txt    # tambahan untuk pengembangan (tes)
+pip install -r requirements-dev.txt      # untuk tes
 
 python -m app.main
 ```
@@ -383,7 +383,9 @@ python -m unittest discover -s tests -t .      # atau: pytest
 ```
 
 Terdapat lebih dari 200 tes otomatis. Tes GUI (`tests/test_gui_smoke.py`) memakai Qt mode `offscreen`, jadi tidak
-ada jendela yang muncul, dan dilewati otomatis bila PySide6 belum terpasang.
+ada jendela yang muncul. Tes ini dilewati otomatis bila PySide6 belum terpasang atau Python 3.14 digunakan;
+Qt offscreen dengan `QThread` dapat mengabort interpreter Python 3.14. Uji mandiri hasil build tetap memverifikasi
+bahwa GUI, plugin gambar, dan konversi berjalan pada executable.
 
 | Berkas tes | Mencakup |
 |---|---|
@@ -423,9 +425,10 @@ ada jendela yang muncul, dan dilewati otomatis bila PySide6 belum terpasang.
 
 ## Membangun Installer (Rilis)
 
-Prasyarat di komputer pembuat: virtualenv proyek aktif dengan `pip install -r requirements.txt`, dan
-[Inno Setup](https://jrsoftware.org/isinfo.php) 6.3 atau lebih baru. Internet hanya diperlukan untuk memasang alat
-build (PyInstaller), bukan untuk aplikasinya.
+Prasyarat di komputer pembuat: Python 3.14 dalam virtualenv proyek aktif, `requirements.txt` dan
+`requirements-dev.txt` terpasang, serta [Inno Setup](https://jrsoftware.org/isinfo.php) 6.3 atau 7.
+Skrip mencari compiler Inno Setup 7 terlebih dahulu, lalu versi 6. Internet hanya diperlukan untuk memasang
+alat build (PyInstaller), bukan untuk aplikasinya.
 
 ```powershell
 .\scripts\windows\build.ps1                  # alur lengkap

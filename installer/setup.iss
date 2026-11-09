@@ -1,4 +1,4 @@
-; Skrip installer Doxify (Inno Setup 6). Dibuat lewat scripts\windows\build.ps1, yang mengirim versi:
+; Skrip installer Doxify (Inno Setup 6.3+ atau 7). Dibuat lewat scripts\windows\build.ps1, yang mengirim versi:
 ;     ISCC.exe /DAppVersion=1.0.0 installer\setup.iss
 ; Nilai bawaan di bawah dipakai bila skrip ini dikompilasi langsung dari Inno Setup.
 #ifndef AppVersion
